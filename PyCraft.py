@@ -23,11 +23,18 @@ SAVES_DIR = os.path.join(PYCRAFT_DIR, 'saves')
 USERS_DIR = os.path.join(PYCRAFT_DIR, 'Users')
 os.makedirs(SAVES_DIR, exist_ok=True)
 os.makedirs(USERS_DIR, exist_ok=True)
+TEXTUREPACKS_DIR = os.path.join(PYCRAFT_DIR, 'texturepacks')
+os.makedirs(TEXTUREPACKS_DIR, exist_ok=True)
 
 import glfw
 from OpenGL.GL import *
 from OpenGL.GLU import *
 import numpy as np
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 
 # ========================== PERLIN NOISE ==========================
@@ -390,6 +397,159 @@ class Chunk:
             self.blocks[x, y, z] = block_type
             self.dirty = True
 
+# ========================== TEXTURE PACKS ==========================
+
+# Standard block name mapping for texture packs
+BLOCK_TEXTURE_NAMES = {
+    BLOCK_GRASS: {'top': 'grass_top', 'bottom': 'dirt', 'side': 'grass_side'},
+    BLOCK_DIRT: {'all': 'dirt'},
+    BLOCK_STONE: {'all': 'stone'},
+    BLOCK_WOOD: {'top': 'log_oak_top', 'bottom': 'log_oak_top', 'side': 'log_oak'},
+    BLOCK_LEAVES: {'all': 'leaves_oak'},
+    BLOCK_SAND: {'all': 'sand'},
+    BLOCK_WATER: {'all': 'water_still'},
+    BLOCK_COBBLESTONE: {'all': 'cobblestone'},
+    BLOCK_PLANKS: {'all': 'planks_oak'},
+    BLOCK_BEDROCK: {'all': 'bedrock'},
+    BLOCK_COAL_ORE: {'all': 'coal_ore'},
+    BLOCK_IRON_ORE: {'all': 'iron_ore'},
+    BLOCK_GLASS: {'all': 'glass'},
+    BLOCK_BRICK: {'all': 'brick'},
+    BLOCK_SNOW: {'all': 'snow'},
+}
+
+
+class TexturePack:
+    """Loads block textures from PNG files or generates procedural fallbacks."""
+
+    def __init__(self, pack_path=None):
+        self.pack_path = pack_path
+        self.textures = {}  # block_id -> {'top': tex_id, 'side': tex_id, 'bottom': tex_id}
+        self.atlas_texture = None
+        self.enabled = HAS_PIL and pack_path is not None
+
+    def load(self):
+        """Load textures from disk, or generate procedural ones."""
+        if not HAS_PIL:
+            print("PIL not installed - using color-only rendering")
+            return False
+
+        for block_id, faces in BLOCK_TEXTURE_NAMES.items():
+            self.textures[block_id] = {}
+            for face_type, tex_name in faces.items():
+                tex_id = self._load_texture(tex_name, block_id)
+                self.textures[block_id][face_type] = tex_id
+        return True
+
+    def _load_texture(self, name, block_id):
+        """Load a single texture PNG or generate procedural."""
+        # Try to load from pack
+        if self.pack_path:
+            for subfolder in ['blocks', 'block', '']:
+                for ext in ['.png', '.PNG']:
+                    path = os.path.join(self.pack_path, subfolder, name + ext)
+                    if os.path.isfile(path):
+                        try:
+                            return self._png_to_gl(path)
+                        except Exception as e:
+                            print("Failed to load " + path + ": " + str(e))
+        
+        # Generate procedural texture
+        return self._generate_procedural(block_id, name)
+
+    def _png_to_gl(self, path):
+        """Convert PNG file to OpenGL texture."""
+        img = Image.open(path).convert('RGBA')
+        # Resize to 16x16 if bigger (support HD packs by downscaling)
+        if img.size[0] > 64:
+            img = img.resize((16, 16), Image.NEAREST)
+        data = np.array(img, dtype=np.uint8)
+        return self._upload_texture(data)
+
+    def _generate_procedural(self, block_id, name):
+        """Generate a 16x16 procedural texture using noise."""
+        size = 16
+        data = np.zeros((size, size, 4), dtype=np.uint8)
+        base = BLOCK_COLORS.get(block_id, (0.5, 0.5, 0.5))
+        r, g, b = int(base[0] * 255), int(base[1] * 255), int(base[2] * 255)
+
+        rng = random.Random(block_id * 1337 + hash(name))
+
+        for y in range(size):
+            for x in range(size):
+                # Add noise variation
+                var = rng.randint(-25, 25)
+                # Different patterns per block
+                if block_id == BLOCK_WOOD and 'side' in name:
+                    # Wood grain
+                    if x % 4 == 0:
+                        var -= 30
+                elif block_id == BLOCK_BRICK:
+                    # Brick pattern
+                    if y % 4 == 0 or (x % 8 == 0 and (y // 4) % 2 == 0) or ((x + 4) % 8 == 0 and (y // 4) % 2 == 1):
+                        var -= 40
+                elif block_id == BLOCK_LEAVES:
+                    # Random gaps
+                    if rng.random() < 0.15:
+                        data[y, x] = [0, 0, 0, 0]
+                        continue
+                elif block_id == BLOCK_GLASS:
+                    # Mostly transparent with edges
+                    if 1 < x < 14 and 1 < y < 14:
+                        data[y, x] = [200, 220, 240, 50]
+                        continue
+
+                nr = max(0, min(255, r + var))
+                ng = max(0, min(255, g + var))
+                nb = max(0, min(255, b + var))
+                data[y, x] = [nr, ng, nb, 255]
+
+        return self._upload_texture(data)
+
+    def _upload_texture(self, data):
+        """Upload pixel data to OpenGL and return texture ID."""
+        tex_id = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex_id)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        h, w = data.shape[:2]
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data.tobytes())
+        glBindTexture(GL_TEXTURE_2D, 0)
+        return tex_id
+
+    def get_texture(self, block_id, face):
+        """Get texture ID for a block face."""
+        if block_id not in self.textures:
+            return None
+        faces = self.textures[block_id]
+        if 'all' in faces:
+            return faces['all']
+        if face == 'top' and 'top' in faces:
+            return faces['top']
+        if face == 'bottom' and 'bottom' in faces:
+            return faces['bottom']
+        return faces.get('side', faces.get('top'))
+
+    def cleanup(self):
+        for block_faces in self.textures.values():
+            for tex_id in block_faces.values():
+                if tex_id:
+                    glDeleteTextures([tex_id])
+        self.textures.clear()
+
+    @staticmethod
+    def list_packs():
+        """List all installed texture packs."""
+        packs = ['[Procedural]']  # Default option
+        if os.path.exists(TEXTUREPACKS_DIR):
+            for name in sorted(os.listdir(TEXTUREPACKS_DIR)):
+                full = os.path.join(TEXTUREPACKS_DIR, name)
+                if os.path.isdir(full):
+                    packs.append(name)
+        return packs
+
 
 class WorldGenerator:
     def __init__(self, seed=None):
@@ -514,6 +674,7 @@ class World:
         self.generator = WorldGenerator(seed)
         self.save_path = os.path.join(SAVES_DIR, name)
         os.makedirs(self.save_path, exist_ok=True)
+        self.texture_pack = None
 
     def get_chunk(self, cx, cz):
         key = (cx, cz)
@@ -635,14 +796,21 @@ class MeshBuilder:
         'left':   (-1, 0, 0, [(-0.5,-0.5,-0.5),(-0.5,-0.5, 0.5),(-0.5, 0.5, 0.5),(-0.5, 0.5,-0.5)], (-1, 0, 0)),
     }
     FACE_LIGHT = {'top': 1.0, 'bottom': 0.5, 'front': 0.8, 'back': 0.7, 'right': 0.75, 'left': 0.65}
+    FACE_UV = [(0, 0), (1, 0), (1, 1), (0, 1)]  # UV coords for each vertex
 
     @staticmethod
     def build_chunk_mesh(world, chunk):
-        verts = []
-        cols = []
-        norms = []
+        """Returns dict: {texture_id: (vertices, colors, normals, uvs)}"""
+        # Group triangles by texture
+        by_texture = {}  # tex_id -> {'v': [], 'c': [], 'n': [], 'uv': []}
         cx_off = chunk.cx * CHUNK_SIZE
         cz_off = chunk.cz * CHUNK_SIZE
+
+        def get_tex_face_type(fname):
+            if fname == 'top': return 'top'
+            if fname == 'bottom': return 'bottom'
+            return 'side'
+
         for x in range(CHUNK_SIZE):
             for y in range(CHUNK_HEIGHT):
                 for z in range(CHUNK_SIZE):
@@ -652,12 +820,14 @@ class MeshBuilder:
                     wx = cx_off + x
                     wz = cz_off + z
                     base_color = BLOCK_COLORS.get(block, (1, 0, 1))
+
                     for fname, (dx, dy, dz, fverts, normal) in MeshBuilder.FACES.items():
                         nx_, ny_, nz_ = x + dx, y + dy, z + dz
                         if 0 <= nx_ < CHUNK_SIZE and 0 <= ny_ < CHUNK_HEIGHT and 0 <= nz_ < CHUNK_SIZE:
                             nb = int(chunk.blocks[nx_, ny_, nz_])
                         else:
                             nb = world.get_block(wx + dx, ny_, wz + dz)
+
                         if block == BLOCK_WATER:
                             if nb == BLOCK_WATER:
                                 continue
@@ -668,77 +838,124 @@ class MeshBuilder:
                                 continue
                             if nb == block and block == BLOCK_LEAVES:
                                 continue
+
+                        # Get texture for this face
+                        tex_id = 0
+                        if world.texture_pack:
+                            tex_id = world.texture_pack.get_texture(block, get_tex_face_type(fname)) or 0
+
                         light = MeshBuilder.FACE_LIGHT[fname]
                         fc = base_color
-                        if block == BLOCK_GRASS:
+                        if block == BLOCK_GRASS and tex_id == 0:
                             if fname == 'top':
                                 fc = (0.30, 0.78, 0.22)
                             elif fname == 'bottom':
                                 fc = (0.55, 0.36, 0.16)
                             else:
                                 fc = (0.40, 0.55, 0.20)
-                        color = (fc[0] * light, fc[1] * light, fc[2] * light)
+
+                        # If we have a texture, use white color (so texture shows properly)
+                        if tex_id:
+                            color = (light, light, light)
+                        else:
+                            color = (fc[0] * light, fc[1] * light, fc[2] * light)
+
+                        if tex_id not in by_texture:
+                            by_texture[tex_id] = {'v': [], 'c': [], 'n': [], 'uv': []}
+                        bucket = by_texture[tex_id]
+
                         for idx in (0, 1, 2, 0, 2, 3):
                             vx, vy, vz = fverts[idx]
-                            verts.extend((wx + vx + 0.5, y + vy + 0.5, wz + vz + 0.5))
-                            cols.extend(color)
-                            norms.extend(normal)
-        return (
-            np.array(verts, dtype=np.float32),
-            np.array(cols, dtype=np.float32),
-            np.array(norms, dtype=np.float32),
-        )
+                            u, v = MeshBuilder.FACE_UV[idx]
+                            bucket['v'].extend((wx + vx + 0.5, y + vy + 0.5, wz + vz + 0.5))
+                            bucket['c'].extend(color)
+                            bucket['n'].extend(normal)
+                            bucket['uv'].extend((u, v))
 
+        # Convert to numpy arrays
+        result = {}
+        for tex_id, data in by_texture.items():
+            result[tex_id] = (
+                np.array(data['v'], dtype=np.float32),
+                np.array(data['c'], dtype=np.float32),
+                np.array(data['n'], dtype=np.float32),
+                np.array(data['uv'], dtype=np.float32),
+            )
+        return result
 
 class ChunkRenderer:
     def __init__(self):
-        self.vbos = {}
+        self.vbos = {}  # (cx,cz) -> {tex_id: (vbo_v, vbo_c, vbo_n, vbo_uv, count)}
 
     def update_chunk(self, world, chunk):
         key = (chunk.cx, chunk.cz)
-        v, c, n = MeshBuilder.build_chunk_mesh(world, chunk)
-        if len(v) == 0:
-            self._delete(key)
+        meshes = MeshBuilder.build_chunk_mesh(world, chunk)
+        self._delete(key)
+        
+        if not meshes:
             chunk.dirty = False
             return
-        self._delete(key)
-        vbo_v = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_v)
-        glBufferData(GL_ARRAY_BUFFER, v.nbytes, v, GL_STATIC_DRAW)
-        vbo_c = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_c)
-        glBufferData(GL_ARRAY_BUFFER, c.nbytes, c, GL_STATIC_DRAW)
-        vbo_n = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_n)
-        glBufferData(GL_ARRAY_BUFFER, n.nbytes, n, GL_STATIC_DRAW)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-        self.vbos[key] = (vbo_v, vbo_c, vbo_n, len(v) // 3)
+        
+        self.vbos[key] = {}
+        for tex_id, (v, c, n, uv) in meshes.items():
+            vbo_v = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_v)
+            glBufferData(GL_ARRAY_BUFFER, v.nbytes, v, GL_STATIC_DRAW)
+            vbo_c = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_c)
+            glBufferData(GL_ARRAY_BUFFER, c.nbytes, c, GL_STATIC_DRAW)
+            vbo_n = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_n)
+            glBufferData(GL_ARRAY_BUFFER, n.nbytes, n, GL_STATIC_DRAW)
+            vbo_uv = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_uv)
+            glBufferData(GL_ARRAY_BUFFER, uv.nbytes, uv, GL_STATIC_DRAW)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            self.vbos[key][tex_id] = (vbo_v, vbo_c, vbo_n, vbo_uv, len(v) // 3)
         chunk.dirty = False
 
     def render_chunk(self, key):
-        entry = self.vbos.get(key)
-        if not entry:
+        entries = self.vbos.get(key)
+        if not entries:
             return
-        vbo_v, vbo_c, vbo_n, count = entry
+        
         glEnableClientState(GL_VERTEX_ARRAY)
         glEnableClientState(GL_COLOR_ARRAY)
         glEnableClientState(GL_NORMAL_ARRAY)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_v)
-        glVertexPointer(3, GL_FLOAT, 0, None)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_c)
-        glColorPointer(3, GL_FLOAT, 0, None)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_n)
-        glNormalPointer(GL_FLOAT, 0, None)
-        glDrawArrays(GL_TRIANGLES, 0, count)
+        
+        for tex_id, (vbo_v, vbo_c, vbo_n, vbo_uv, count) in entries.items():
+            if tex_id:
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, tex_id)
+                glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+                glBindBuffer(GL_ARRAY_BUFFER, vbo_uv)
+                glTexCoordPointer(2, GL_FLOAT, 0, None)
+            else:
+                glDisable(GL_TEXTURE_2D)
+            
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_v)
+            glVertexPointer(3, GL_FLOAT, 0, None)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_c)
+            glColorPointer(3, GL_FLOAT, 0, None)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_n)
+            glNormalPointer(GL_FLOAT, 0, None)
+            
+            glDrawArrays(GL_TRIANGLES, 0, count)
+            
+            if tex_id:
+                glDisableClientState(GL_TEXTURE_COORD_ARRAY)
+        
         glBindBuffer(GL_ARRAY_BUFFER, 0)
+        glDisable(GL_TEXTURE_2D)
         glDisableClientState(GL_VERTEX_ARRAY)
         glDisableClientState(GL_COLOR_ARRAY)
         glDisableClientState(GL_NORMAL_ARRAY)
 
     def _delete(self, key):
-        entry = self.vbos.pop(key, None)
-        if entry:
-            glDeleteBuffers(3, [entry[0], entry[1], entry[2]])
+        entries = self.vbos.pop(key, None)
+        if entries:
+            for tex_id, (vbo_v, vbo_c, vbo_n, vbo_uv, _) in entries.items():
+                glDeleteBuffers(4, [vbo_v, vbo_c, vbo_n, vbo_uv])
 
     def cleanup(self):
         for k in list(self.vbos):
@@ -922,6 +1139,30 @@ class Game:
         glfw.set_framebuffer_size_callback(self.window, self._on_resize)
         self._init_gl()
         self.renderer = ChunkRenderer()
+        
+        # Load texture pack
+        self.texture_pack = None
+        pack_names = TexturePack.list_packs()
+        # Use first non-procedural pack if available, else procedural
+        selected_pack = None
+        for p in pack_names:
+            if p != '[Procedural]':
+                selected_pack = p
+                break
+        
+        if selected_pack:
+            pack_path = os.path.join(TEXTUREPACKS_DIR, selected_pack)
+            print("Loading texture pack: " + selected_pack)
+        else:
+            pack_path = None
+            print("No texture pack found - generating procedural textures")
+        
+        self.texture_pack = TexturePack(pack_path)
+        if self.texture_pack.load():
+            print("Textures loaded successfully")
+        else:
+            print("Failed to load textures")
+            self.texture_pack = None
         if self.acct.auto_login():
             self.state = ST_MAIN
         self.lt = time.time()
